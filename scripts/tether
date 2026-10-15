@@ -30,7 +30,8 @@ Usage: tether <command> <dir> [args...]
   check <dir>                  positive and negative connection tests
   forget <dir>                 delete this target's directory (keys, address)
 
-Environment: TETHER_TAILCAT, TETHER_SSH, TETHER_SCP override the programs used.
+Environment: TETHER_TAILCAT, TETHER_SSH, TETHER_SCP override the programs used;
+TETHER_ADDRESS overrides <dir>/address for one call.
 EOF
 }
 
@@ -43,6 +44,10 @@ need_dir() {
 
 read_address() {
 	local dir=$1
+	if [ -n "${TETHER_ADDRESS:-}" ]; then
+		printf '%s' "$TETHER_ADDRESS" | tr -d ' \r\n'
+		return
+	fi
 	[ -s "$dir/address" ] || die "$dir/address is missing; run: tether set-address $dir <tc-address>"
 	tr -d ' \r\n' <"$dir/address"
 }
