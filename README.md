@@ -138,6 +138,8 @@ routes by node key and two connections sharing one take the route from each othe
   - Linux: `systemctl --user status agent-tether` and `loginctl show-user "$USER" -p Linger`
   - macOS: `sudo launchctl print system/agent-tether`
   - Windows: `Get-ScheduledTask agent-tether`
+  A Mac that idle-sleeps answers only in short wake windows, so the first connection after a
+  pause can fail with `Dial: context deadline exceeded`; install with `--stay-awake`.
 - **Linux: only works while logged in**: `sudo loginctl enable-linger "$USER"`.
 - **Linux over SSH: `systemctl --user` cannot connect to the bus**: set
   `XDG_RUNTIME_DIR=/run/user/$(id -u)` and
