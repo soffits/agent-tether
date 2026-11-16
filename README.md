@@ -38,7 +38,7 @@ netcat/SSH over WireGuard. tailcat needs no Tailscale account and no root to run
 |---|---|---|
 | Linux (systemd) | systemd user unit + lingering | pattern tested on a real machine |
 | Windows 10/11 | scheduled task, at startup, S4U | pattern tested on a real machine |
-| macOS | LaunchDaemon with `UserName` | **untested**, needs a real Mac |
+| macOS | LaunchDaemon with `UserName` | tested on a real Mac (macOS 27, Apple Silicon, Homebrew tailcat) |
 
 The elevated one-paste bootstrap, the privileged option (sudoers drop-in / `RunLevel Highest`)
 and remote self-removal are new and not yet verified on real machines.
@@ -76,8 +76,8 @@ The installers live in `scripts/`; their options are documented at the top of ea
 # Linux, as the user (or as root with --user NAME)
 scripts/install-linux.sh install --client-nodekey nodekey:<hex> --authorized-key "ssh-ed25519 AAAA... agent-tether"
 
-# macOS
-sudo scripts/install-macos.sh install --user NAME --client-nodekey nodekey:<hex> --authorized-key "ssh-ed25519 AAAA... agent-tether"
+# macOS, as the user (asks for the password once; safe to rerun, keeps the address)
+scripts/install-macos.sh install --client-nodekey nodekey:<hex> --authorized-key "ssh-ed25519 AAAA... agent-tether"
 ```
 
 ```powershell
@@ -86,7 +86,13 @@ powershell -ExecutionPolicy Bypass -File scripts\install-windows.ps1 install -Cl
 ```
 
 Optional flags: `--privileged` / `-Privileged` (agent may act as admin without asking),
-`--stay-awake` / `-NoSleepOnAC` (no sleep on AC power).
+`--stay-awake` / `-NoSleepOnAC` (no sleep on AC power). `--client-nodekey` can be repeated,
+one per agent client key.
+
+On macOS the installer uses Homebrew's tailcat (installing it if needed). Without Homebrew,
+build tailcat from a release tag and pass `--tailcat FILE --tailcat-sha256 HEX`.
+`--open-settings` opens System Settings at Full Disk Access, which the shell needs to read
+Desktop, Documents and Downloads.
 
 Everything on the target lives in one folder: `~/.config/agent-tether/`
 (`%USERPROFILE%\.config\agent-tether\` on Windows): the server key, its address, and the
@@ -95,17 +101,22 @@ agent's authorized SSH key.
 ## Using it (agent side)
 
 ```bash
-T=~/.local/share/agent-tether/my-laptop
-scripts/tether keygen "$T"                  # agent's client key + SSH key
-scripts/tether set-address "$T" 'tc...'     # the target's address
-scripts/tether check "$T"                   # positive and negative connection tests
-scripts/tether ssh "$T" 'uname -a'
-scripts/tether run "$T" ./script.sh         # POSIX targets: runs via bash -s
-scripts/tether scp "$T" ./file target:/tmp/
-scripts/tether ping "$T"
+scripts/tether keygen my-laptop --keys 4     # agent's client keys + SSH key
+scripts/tether set-address my-laptop 'tc...' # the target's address
+scripts/tether check my-laptop               # positive and negative connection tests
+scripts/tether ssh my-laptop 'uname -a'
+scripts/tether run my-laptop ./script.sh     # Linux/macOS: bash -s; Windows: a .ps1 run with -File
+scripts/tether scp my-laptop ./file target:/tmp/
+scripts/tether list
 ```
 
-Linux and macOS sessions use your login shell; Windows sessions use PowerShell.
+A target is a directory of keys and the address; a bare name like `my-laptop` means
+`$TETHER_DIR/my-laptop` (default `~/.local/share/agent-tether`). Linux and macOS sessions
+use your login shell; Windows sessions use PowerShell.
+
+Each connection that is open at the same time needs its own client key, because the relay
+routes by node key and two connections sharing one take the route from each other.
+`tether` picks a free key from the target's pool and locks it while the connection lasts.
 
 ## Security model
 
@@ -127,6 +138,8 @@ Linux and macOS sessions use your login shell; Windows sessions use PowerShell.
   - Linux: `systemctl --user status agent-tether` and `loginctl show-user "$USER" -p Linger`
   - macOS: `sudo launchctl print system/agent-tether`
   - Windows: `Get-ScheduledTask agent-tether`
+  A Mac that idle-sleeps answers only in short wake windows, so the first connection after a
+  pause can fail with `Dial: context deadline exceeded`; install with `--stay-awake`.
 - **Linux: only works while logged in**: `sudo loginctl enable-linger "$USER"`.
 - **Linux over SSH: `systemctl --user` cannot connect to the bus**: set
   `XDG_RUNTIME_DIR=/run/user/$(id -u)` and
@@ -134,7 +147,12 @@ Linux and macOS sessions use your login shell; Windows sessions use PowerShell.
 - **Windows: "Access is denied" when installing**: run from an elevated prompt. Without it the
   installer uses an at-logon task, which is reachable only after you sign in.
 - **macOS: shell cannot read Desktop/Documents**: give the tailcat binary Full Disk Access in
-  System Settings > Privacy & Security.
+  System Settings > Privacy & Security (the installer prints its path). A Homebrew upgrade
+  moves the binary, so the grant may need switching on again.
+- **New dials time out while another connection is open**: both share a client key; make a
+  pool with `tether keygen <target> --keys 4` and add the new nodekeys to the installer's
+  `--client-nodekey` list.
+- **scp fails with an SFTP error**: tailcat has no SFTP; `tether scp` passes `-O`.
 
 ## Uninstall
 
@@ -143,7 +161,7 @@ you can run the installer's `uninstall`:
 
 ```bash
 scripts/install-linux.sh uninstall
-sudo scripts/install-macos.sh uninstall --user NAME
+scripts/install-macos.sh uninstall
 ```
 
 ```powershell
@@ -181,8 +199,10 @@ On the agent's side: `scripts/tether forget <dir>`.
 ## Tests
 
 ```bash
+tests/test-tether.sh                                              # stubs tailcat/ssh/scp
 PATH=/path/to/tailcat-dir:$PATH tests/test-keygen.sh
 PATH=/path/to/tailcat-dir:$PATH tests/test-linux-installer.sh   # stubs systemd, touches nothing real
+PATH=/path/to/tailcat-dir:$PATH tests/test-macos-installer.sh   # stubs launchd and Homebrew
 shellcheck scripts/tether scripts/*.sh tests/*.sh
 ```
 

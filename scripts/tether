@@ -1,59 +1,160 @@
 #!/usr/bin/env bash
 # tether: agent-side helper for agent-tether.
 # One directory per target machine holds everything for that target:
-#   address              the target's tailcat address (a secret)
-#   os                   linux | macos | windows
-#   client.private.json  the agent's tailcat client key (its nodekey goes into --allow)
-#   id_ed25519[.pub]     the agent's SSH key (the .pub goes into authorized_keys)
-#   known_hosts          SSH host keys seen for this target
+#   address                the target's tailcat address (a secret)
+#   os                     linux | macos | windows (default: linux)
+#   remote-dir             the agent's folder on the target, relative to its home
+#                          (default: .config/agent-tether)
+#   client.private.json    the agent's tailcat client key (its nodekey goes into --allow)
+#   client-N.private.json  optional extra client keys, one per simultaneous connection
+#   id_ed25519[.pub]       the agent's SSH key (the .pub goes into authorized_keys)
+#   known_hosts            SSH host keys seen for this target
+# A <target> is a path to such a directory (anything with a "/") or a name
+# looked up in $TETHER_DIR.
 set -euo pipefail
 
-TAILCAT="${TETHER_TAILCAT:-tailcat}"
+TETHER_DIR="${TETHER_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/agent-tether}"
 SSH="${TETHER_SSH:-ssh}"
 SCP="${TETHER_SCP:-scp}"
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 
 usage() {
 	cat <<'EOF'
-Usage: tether <command> <dir> [args...]
+Usage: tether <command> <target> [args...]
 
-  keygen <dir>                 create the agent's client tailcat key and SSH key;
-                               prints NODEKEY= and SSH_PUBKEY=
-  bootstrap <dir> <os> [--no-sudo]
+  keygen <target> [--keys N]   create the agent's tailcat client key(s) and SSH key;
+                               prints one NODEKEY= line per client key and SSH_PUBKEY=
+  bootstrap <target> <os> [--no-sudo]
                                record the target OS (linux|macos|windows) and print the
                                one-time command the user pastes on the target
-  set-address <dir> <addr>     save the target's tailcat address
-  ssh <dir> [command...]       run a command on the target (no command: interactive shell)
-  run <dir> <script> [args...] POSIX targets: run a local bash script remotely (bash -s)
-  push <dir> <local> <remote>  copy one local file to a remote path through stdin
-  scp <dir> [scp args...]      scp through the tether; name the remote side "target:"
-  ping <dir>                   tailcat ping with the agent's client key
-  check <dir>                  positive and negative connection tests
-  forget <dir>                 delete this target's directory (keys, address)
+  set-address <target> <addr>  save the target's tailcat address
+  ssh <target> [command...]    run a command on the target (no command: interactive shell)
+  run <target> [--with FILE]... <script> [args...]
+                               run a local script on the target: bash -s on Linux and
+                               macOS; on Windows the .ps1 is copied to <remote-dir>/run
+                               and run with powershell -File. --with copies extra files
+                               to <remote-dir>/run first
+  push <target> <local> <remote>
+                               copy one local text file to a remote path through stdin
+  scp <target> [scp args...]   scp through the tether; name the remote side "target:"
+  forward <target> <address> <local:remote>...
+                               tailcat forward to another tailcat server (an address that
+                               accepts the same client keys) using a free client key of the
+                               target, held while it runs
+  ping <target>                tailcat ping with the agent's client key
+  check <target>               positive and negative connection tests
+  list                         targets saved in $TETHER_DIR
+  forget <target>              delete this target's directory (keys, address)
 
-Environment: TETHER_TAILCAT, TETHER_SSH, TETHER_SCP override the programs used;
-TETHER_ADDRESS overrides <dir>/address for one call.
+<target> is a directory, or a name under $TETHER_DIR
+(default ~/.local/share/agent-tether); write ./name for a directory here.
+
+Environment:
+  TETHER_DIR      where target names are looked up
+  TETHER_ADDRESS  overrides <target>/address for one call
+  TETHER_TAILCAT, TETHER_SSH, TETHER_SCP override the programs used
 EOF
 }
 
 die() { echo "tether: $*" >&2; exit 1; }
 
+find_tailcat() {
+	local c
+	for c in "${TETHER_TAILCAT:-}" "$(command -v tailcat 2>/dev/null || true)" \
+		"$HOME/.local/bin/tailcat" /opt/homebrew/bin/tailcat /usr/local/bin/tailcat /usr/bin/tailcat "$HOME/go/bin/tailcat"; do
+		if [ -n "$c" ] && [ -x "$c" ]; then
+			TAILCAT=$c
+			return
+		fi
+	done
+	die "tailcat not found; install it (https://github.com/tailscale/tailcat/blob/main/INSTALL.md) or set TETHER_TAILCAT"
+}
+
+# Sets DIR from a <target> argument.
+resolve() {
+	local t=${1:-}
+	[ -n "$t" ] || die "missing <target>"
+	case "$t" in
+	*/*) DIR=$t ;;
+	*) DIR=$TETHER_DIR/$t ;;
+	esac
+}
+
 need_dir() {
-	[ -n "${1:-}" ] || die "missing <dir>"
-	[ -d "$1" ] || die "no such directory: $1"
+	resolve "${1:-}"
+	[ -d "$DIR" ] || die "no such target directory: $DIR"
+	DIR=$(cd "$DIR" && pwd)
 }
 
 read_address() {
-	local dir=$1
 	if [ -n "${TETHER_ADDRESS:-}" ]; then
 		printf '%s' "$TETHER_ADDRESS" | tr -d ' \r\n'
 		return
 	fi
-	[ -s "$dir/address" ] || die "$dir/address is missing; run: tether set-address $dir <tc-address>"
-	tr -d ' \r\n' <"$dir/address"
+	[ -s "$DIR/address" ] || die "$DIR/address is missing; run: tether set-address $DIR <tc-address>"
+	tr -d ' \r\n' <"$DIR/address"
 }
 
 target_os() {
 	if [ -s "$1/os" ]; then tr -d ' \r\n' <"$1/os"; else echo linux; fi
+}
+
+remote_dir() {
+	local d=.config/agent-tether
+	if [ -s "$DIR/remote-dir" ]; then d=$(tr -d '\r\n' <"$DIR/remote-dir"); fi
+	case "$d" in /* | *[!A-Za-z0-9._/-]* | "") die "$DIR/remote-dir must be a plain path relative to the home folder" ;; esac
+	printf '%s' "${d%/}"
+}
+
+client_keys() {
+	local k
+	KEYS=("$DIR/client.private.json")
+	for k in "$DIR"/client-[0-9]*.private.json; do
+		if [ -e "$k" ]; then KEYS+=("$k"); fi
+	done
+}
+
+# Picks a client key that no other tether connection is using and holds a lock
+# on it for as long as this process (or what it execs) lives. The DERP relay
+# routes by node key, so two live connections with the same client key take the
+# route from each other and new dials time out. Without flock (or with one key)
+# it uses the first key.
+acquire_key() {
+	local k name wait
+	client_keys
+	KEY=${KEYS[0]}
+	if [ ${#KEYS[@]} -eq 1 ] || [ "${BASH_VERSINFO[0]}" -lt 4 ] || ! command -v flock >/dev/null 2>&1; then
+		return 0
+	fi
+	mkdir -p "$DIR/locks"
+	for wait in 0 5 10 20 40; do
+		sleep "$wait"
+		for k in "${KEYS[@]}"; do
+			name=$(basename "$k" .private.json)
+			exec {LOCK_FD}>"$DIR/locks/$name.lock"
+			if flock -n "$LOCK_FD"; then
+				KEY=$k
+				return 0
+			fi
+			exec {LOCK_FD}>&-
+		done
+	done
+	die "every client key in $DIR is in use"
+}
+
+release_key() {
+	if [ -n "${LOCK_FD:-}" ]; then
+		exec {LOCK_FD}>&-
+		LOCK_FD=""
+	fi
+}
+
+nodekey_of() {
+	"$TAILCAT" --key="$1" printpub
+}
+
+sha16() {
+	if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi | cut -c1-16
 }
 
 # Quote a word for the POSIX shell OpenSSH uses to run ProxyCommand,
@@ -65,98 +166,178 @@ proxy_quote() {
 }
 
 ssh_opts() {
-	local dir addr alias
-	dir=$(cd "$1" && pwd)
-	addr=$(read_address "$dir")
+	local addr alias
+	addr=$(read_address)
 	# One host key alias per address: the temporary bootstrap listener and the
 	# permanent service have different addresses and host keys.
-	alias="tether-$(printf '%s' "$addr" | sha256sum | cut -c1-16)"
+	alias="tether-$(printf '%s' "$addr" | sha16)"
 	SSH_BASE=(
 		-F /dev/null
 		-o IdentitiesOnly=yes
 		-o BatchMode=yes
 		-o StrictHostKeyChecking=accept-new
-		-o "UserKnownHostsFile=$dir/known_hosts"
+		-o "UserKnownHostsFile=$DIR/known_hosts"
 		-o "HostKeyAlias=$alias"
+		-o ConnectTimeout=40
 		-o ServerAliveInterval=15
 		-o ServerAliveCountMax=4
 		-o LogLevel=ERROR
-		-o "ProxyCommand=$(proxy_quote "$TAILCAT") --key=$(proxy_quote "$dir/client.private.json") $(proxy_quote "$addr") 22"
+		-o "ProxyCommand=$(proxy_quote "$SELF") proxy $(proxy_quote "$DIR")"
 	)
-	SSH_OPTS=("${SSH_BASE[@]}" -i "$dir/id_ed25519")
+	SSH_OPTS=("${SSH_BASE[@]}" -i "$DIR/id_ed25519")
+}
+
+# tailcat's SSH server has no SFTP subsystem, so scp needs the legacy protocol
+# (-O) where the client has it. -S makes scp use the same ssh as tether.
+scp_opts() {
+	local ssh_path
+	ssh_path=$(command -v "$SSH" 2>/dev/null || echo "$SSH")
+	SCP_OPTS=(-S "$ssh_path")
+	# scp before OpenSSH 8.7 has no -O, but speaks only the SCP protocol anyway.
+	if ! "$SCP" -O 2>&1 | grep -qiE 'unknown option|illegal option'; then
+		SCP_OPTS=(-O "${SCP_OPTS[@]}")
+	fi
+}
+
+# Runs a command. When the connection could not be opened (ssh exit 255) it
+# says why that usually is: tailcat gives up a dial after 10 seconds, and a
+# machine that is asleep answers only during short wake windows.
+attempt() {
+	local rc=0
+	"$@" || rc=$?
+	if [ "$rc" -eq 255 ]; then
+		echo "tether: could not open the connection; if the target was idle it may have been asleep (see \"Flaky dials\" in SKILL.md)" >&2
+	fi
+	return "$rc"
 }
 
 cmd_keygen() {
-	local dir=${1:-}
-	[ -n "$dir" ] || die "usage: tether keygen <dir>"
-	mkdir -p "$dir"
-	chmod 700 "$dir"
-	if [ ! -s "$dir/client.private.json" ]; then
-		"$TAILCAT" genkey --client --key="$dir/client.private.json" >/dev/null 2>&1 ||
-			die "tailcat genkey failed (is tailcat installed and on PATH?)"
+	local keys=1 i k
+	resolve "${1:-}"
+	shift
+	if [ "${1:-}" = --keys ]; then
+		keys=${2:-}
+		case "$keys" in [1-9] | [1-9][0-9]) ;; *) die "--keys takes a number from 1 to 99" ;; esac
 	fi
-	if [ ! -s "$dir/id_ed25519" ]; then
-		ssh-keygen -q -t ed25519 -N '' -C agent-tether -f "$dir/id_ed25519"
+	mkdir -p "$DIR"
+	chmod 700 "$DIR"
+	for i in $(seq 1 "$keys"); do
+		k=$DIR/client.private.json
+		if [ "$i" -gt 1 ]; then k=$DIR/client-$i.private.json; fi
+		if [ ! -s "$k" ]; then
+			"$TAILCAT" genkey --client --key="$k" >/dev/null 2>&1 ||
+				die "tailcat genkey failed (is tailcat installed?)"
+		fi
+	done
+	if [ ! -s "$DIR/id_ed25519" ]; then
+		ssh-keygen -q -t ed25519 -N '' -C agent-tether -f "$DIR/id_ed25519"
 	fi
-	echo "NODEKEY=$("$TAILCAT" --key="$dir/client.private.json" printpub)"
-	echo "SSH_PUBKEY=$(cat "$dir/id_ed25519.pub")"
+	client_keys
+	for k in "${KEYS[@]}"; do echo "NODEKEY=$(nodekey_of "$k")"; done
+	echo "SSH_PUBKEY=$(cat "$DIR/id_ed25519.pub")"
 }
 
 cmd_bootstrap() {
-	local dir=${1:-} os=${2:-} sudo_prefix='sudo ' nodekey pub
-	need_dir "$dir"
-	[ "${3:-}" = "--no-sudo" ] && sudo_prefix=''
-	case "$os" in linux | macos | windows) ;; *) die "usage: tether bootstrap <dir> linux|macos|windows [--no-sudo]" ;; esac
-	[ -s "$dir/client.private.json" ] && [ -s "$dir/id_ed25519.pub" ] || die "run: tether keygen $dir"
-	echo "$os" >"$dir/os"
-	nodekey=$("$TAILCAT" --key="$dir/client.private.json" printpub)
-	pub=$(cut -d' ' -f1-2 <"$dir/id_ed25519.pub")
+	local os=${2:-} sudo_prefix='sudo ' allow pub k
+	need_dir "${1:-}"
+	if [ "${3:-}" = "--no-sudo" ]; then sudo_prefix=''; fi
+	case "$os" in linux | macos | windows) ;; *) die "usage: tether bootstrap <target> linux|macos|windows [--no-sudo]" ;; esac
+	[ -s "$DIR/client.private.json" ] && [ -s "$DIR/id_ed25519.pub" ] || die "run: tether keygen $DIR"
+	echo "$os" >"$DIR/os"
+	client_keys
+	allow=""
+	for k in "${KEYS[@]}"; do allow="$allow${allow:+,}$(nodekey_of "$k")"; done
+	pub=$(cut -d' ' -f1-2 <"$DIR/id_ed25519.pub")
 	if [ "$os" = windows ]; then
-		echo "tailcat serve --key=new --allow=$nodekey --ssh-authorized-keys=\"$pub agent-tether\" ssh"
+		echo "tailcat serve --key=new --allow=$allow --ssh-authorized-keys=\"$pub agent-tether\" ssh"
 	else
-		echo "bash -c '${sudo_prefix}\"\$(command -v tailcat)\" serve --key=new --allow=$nodekey --ssh-authorized-keys=\"$pub agent-tether\" ssh'"
+		echo "bash -c '${sudo_prefix}\"\$(command -v tailcat)\" serve --key=new --allow=$allow --ssh-authorized-keys=\"$pub agent-tether\" ssh'"
 	fi
 }
 
 cmd_set_address() {
-	local dir=${1:-} addr=${2:-}
-	need_dir "$dir"
+	local addr=${2:-}
+	need_dir "${1:-}"
 	addr=$(printf '%s' "$addr" | tr -d ' \r\n')
 	case "$addr" in tc?*) ;; *) die "that does not look like a tailcat address (they start with \"tc\")" ;; esac
-	(umask 077 && printf '%s\n' "$addr" >"$dir/address")
-	echo "saved $dir/address"
+	(umask 077 && printf '%s\n' "$addr" >"$DIR/address")
+	echo "saved $DIR/address"
+}
+
+cmd_proxy() {
+	local addr
+	need_dir "${1:-}"
+	addr=$(read_address)
+	acquire_key
+	exec "$TAILCAT" --key="$KEY" "$addr" 22
 }
 
 cmd_ssh() {
-	local dir=${1:-}
-	need_dir "$dir"
+	need_dir "${1:-}"
 	shift
-	ssh_opts "$dir"
+	ssh_opts
 	if [ $# -eq 0 ]; then
 		exec "$SSH" "${SSH_OPTS[@]}" -t target
 	fi
-	exec "$SSH" "${SSH_OPTS[@]}" target "$@"
+	attempt "$SSH" "${SSH_OPTS[@]}" target "$@"
+}
+
+remote_mkdir() {
+	local d=$1
+	if [ "$(target_os "$DIR")" = windows ]; then
+		attempt "$SSH" "${SSH_OPTS[@]}" target \
+			"New-Item -ItemType Directory -Force (Join-Path \$env:USERPROFILE '${d//\//\\}') | Out-Null"
+	else
+		attempt "$SSH" "${SSH_OPTS[@]}" target "mkdir -p '$d'"
+	fi
+}
+
+copy_to() {
+	attempt "$SCP" "${SCP_OPTS[@]}" -q "${SSH_OPTS[@]}" "$1" "target:$2"
+}
+
+run_posix() {
+	local script=$1
+	shift
+	"$SSH" "${SSH_OPTS[@]}" target "bash -s -- $*" <"$script"
 }
 
 cmd_run() {
-	local dir=${1:-} script=${2:-}
-	need_dir "$dir"
-	[ -f "$script" ] || die "usage: tether run <dir> <script> [args...]"
-	shift 2
-	[ "$(target_os "$dir")" != windows ] || die "run is for POSIX targets; on Windows use push, then ssh"
-	ssh_opts "$dir"
-	local args=() a
-	for a in "$@"; do args+=("$(printf '%q' "$a")"); done
-	# bash -s works whatever the login shell is (fish, zsh, sh).
-	exec "$SSH" "${SSH_OPTS[@]}" target "bash -s -- ${args[*]}" <"$script"
+	local with=() script rdir f a args=()
+	need_dir "${1:-}"
+	shift
+	while [ "${1:-}" = --with ]; do
+		[ -f "${2:-}" ] || die "--with needs an existing file"
+		with+=("$2")
+		shift 2
+	done
+	script=${1:-}
+	[ -f "$script" ] || die "usage: tether run <target> [--with FILE]... <script> [args...]"
+	shift
+	ssh_opts
+	rdir=$(remote_dir)/run
+	if [ ${#with[@]} -gt 0 ] || [ "$(target_os "$DIR")" = windows ]; then
+		scp_opts
+		remote_mkdir "$rdir"
+		for f in ${with[@]+"${with[@]}"}; do copy_to "$f" "$rdir/$(basename "$f")"; done
+	fi
+	if [ "$(target_os "$DIR")" = windows ]; then
+		copy_to "$script" "$rdir/$(basename "$script")"
+		attempt "$SSH" "${SSH_OPTS[@]}" target \
+			powershell -NoProfile -ExecutionPolicy Bypass -File "${rdir//\//\\}\\$(basename "$script")" "$@"
+	else
+		for a in "$@"; do args+=("$(printf '%q' "$a")"); done
+		# bash -s works whatever the login shell is (fish, zsh, sh).
+		attempt run_posix "$script" ${args[@]+"${args[@]}"}
+	fi
 }
 
 cmd_push() {
-	local dir=${1:-} src=${2:-} dst=${3:-}
-	need_dir "$dir"
-	[ -f "$src" ] && [ -n "$dst" ] || die "usage: tether push <dir> <local-file> <remote-path>"
-	ssh_opts "$dir"
-	if [ "$(target_os "$dir")" = windows ]; then
+	local src=${2:-} dst=${3:-}
+	need_dir "${1:-}"
+	[ -f "$src" ] && [ -n "$dst" ] || die "usage: tether push <target> <local-file> <remote-path>"
+	ssh_opts
+	if [ "$(target_os "$DIR")" = windows ]; then
 		case "$dst" in *"'"*) die "remote path must not contain single quotes" ;; esac
 		"$SSH" "${SSH_OPTS[@]}" target \
 			"\$t = [Console]::In.ReadToEnd(); [IO.File]::WriteAllText([Environment]::ExpandEnvironmentVariables('$dst'), \$t)" <"$src"
@@ -167,35 +348,48 @@ cmd_push() {
 }
 
 cmd_scp() {
-	local dir=${1:-}
-	need_dir "$dir"
+	need_dir "${1:-}"
 	shift
-	ssh_opts "$dir"
-	exec "$SCP" "${SSH_OPTS[@]}" "$@"
+	ssh_opts
+	scp_opts
+	attempt "$SCP" "${SCP_OPTS[@]}" "${SSH_OPTS[@]}" "$@"
+}
+
+cmd_forward() {
+	local addr=${2:-}
+	need_dir "${1:-}"
+	[ -n "$addr" ] && [ $# -ge 3 ] || die "usage: tether forward <target> <address> <local:remote>..."
+	shift 2
+	acquire_key
+	exec "$TAILCAT" --key="$KEY" forward "$addr" "$@"
 }
 
 cmd_ping() {
-	local dir=${1:-}
-	need_dir "$dir"
-	"$TAILCAT" --key="$dir/client.private.json" ping "$(read_address "$dir")"
+	local addr
+	need_dir "${1:-}"
+	addr=$(read_address)
+	acquire_key
+	"$TAILCAT" --key="$KEY" ping "$addr"
 }
 
 cmd_check() {
-	local dir=${1:-} addr fails=0 tmp
-	need_dir "$dir"
-	addr=$(read_address "$dir")
-	if "$TAILCAT" --key="$dir/client.private.json" ping --timeout=20s "$addr" >/dev/null 2>&1; then
+	local addr fails=0 tmp out
+	need_dir "${1:-}"
+	addr=$(read_address)
+	acquire_key
+	if "$TAILCAT" --key="$KEY" ping --timeout=20s "$addr" >/dev/null 2>&1; then
 		echo "PASS ping with the agent's client key"
 	else
 		echo "FAIL ping with the agent's client key"; fails=$((fails + 1))
 	fi
+	release_key
 	if "$TAILCAT" --key=new ping --timeout=8s "$addr" >/dev/null 2>&1; then
 		echo "FAIL a fresh, unknown client key got an answer (is --allow set?)"; fails=$((fails + 1))
 	else
 		echo "PASS a fresh, unknown client key is ignored"
 	fi
-	ssh_opts "$dir"
-	if [ "$(target_os "$dir")" = windows ]; then
+	ssh_opts
+	if [ "$(target_os "$DIR")" = windows ]; then
 		out=$("$SSH" "${SSH_OPTS[@]}" target 'Write-Output tether-ok' 2>/dev/null || true)
 	else
 		out=$("$SSH" "${SSH_OPTS[@]}" target 'echo tether-ok' 2>/dev/null || true)
@@ -216,27 +410,40 @@ cmd_check() {
 	[ "$fails" -eq 0 ]
 }
 
+cmd_list() {
+	local d
+	for d in "$TETHER_DIR"/*/; do
+		[ -s "$d/address" ] && [ -s "$d/client.private.json" ] || continue
+		printf '%s\t%s\n' "$(basename "$d")" "$(target_os "$d")"
+	done
+}
+
 cmd_forget() {
-	local dir=${1:-}
-	need_dir "$dir"
-	[ -e "$dir/client.private.json" ] || [ -e "$dir/id_ed25519" ] || die "$dir does not look like a tether directory"
-	rm -rf "$dir"
-	echo "removed $dir"
+	need_dir "${1:-}"
+	[ -e "$DIR/client.private.json" ] || [ -e "$DIR/id_ed25519" ] || die "$DIR does not look like a tether directory"
+	rm -rf "$DIR"
+	echo "removed $DIR"
 }
 
 main() {
 	local cmd=${1:-}
 	[ $# -gt 0 ] && shift
 	case "$cmd" in
+	keygen | bootstrap | proxy | forward | ping | check) find_tailcat ;;
+	esac
+	case "$cmd" in
 	keygen) cmd_keygen "$@" ;;
 	bootstrap) cmd_bootstrap "$@" ;;
 	set-address) cmd_set_address "$@" ;;
+	proxy) cmd_proxy "$@" ;;
 	ssh) cmd_ssh "$@" ;;
 	run) cmd_run "$@" ;;
 	push) cmd_push "$@" ;;
 	scp) cmd_scp "$@" ;;
+	forward) cmd_forward "$@" ;;
 	ping) cmd_ping "$@" ;;
 	check) cmd_check "$@" ;;
+	list) cmd_list ;;
 	forget) cmd_forget "$@" ;;
 	-h | --help | help | "") usage ;;
 	*) usage >&2; exit 2 ;;
