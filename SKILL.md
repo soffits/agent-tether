@@ -238,6 +238,7 @@ scripts/tether scp "$T" ./file target:/tmp/file        # copy (remote side is al
 scripts/tether scp "$T" target:/var/log/syslog ./
 scripts/tether push "$T" ./file '/tmp/file'            # copy through stdin (works for Windows paths too)
 scripts/tether ping "$T"                               # tunnel only; says DERP or direct path
+scripts/tether forward "$T" <address> 18080:8080      # tailcat forward to a service that accepts the same client keys
 ```
 
 - **Copies** use scp's legacy protocol (`-O`), because tailcat's SSH server has no SFTP.

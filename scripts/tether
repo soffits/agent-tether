@@ -37,6 +37,10 @@ Usage: tether <command> <target> [args...]
   push <target> <local> <remote>
                                copy one local text file to a remote path through stdin
   scp <target> [scp args...]   scp through the tether; name the remote side "target:"
+  forward <target> <address> <local:remote>...
+                               tailcat forward to another tailcat server (an address that
+                               accepts the same client keys) using a free client key of the
+                               target, held while it runs
   ping <target>                tailcat ping with the agent's client key
   check <target>               positive and negative connection tests
   list                         targets saved in $TETHER_DIR
@@ -351,6 +355,15 @@ cmd_scp() {
 	attempt "$SCP" "${SCP_OPTS[@]}" "${SSH_OPTS[@]}" "$@"
 }
 
+cmd_forward() {
+	local addr=${2:-}
+	need_dir "${1:-}"
+	[ -n "$addr" ] && [ $# -ge 3 ] || die "usage: tether forward <target> <address> <local:remote>..."
+	shift 2
+	acquire_key
+	exec "$TAILCAT" --key="$KEY" forward "$addr" "$@"
+}
+
 cmd_ping() {
 	local addr
 	need_dir "${1:-}"
@@ -416,7 +429,7 @@ main() {
 	local cmd=${1:-}
 	[ $# -gt 0 ] && shift
 	case "$cmd" in
-	keygen | bootstrap | proxy | ping | check) find_tailcat ;;
+	keygen | bootstrap | proxy | forward | ping | check) find_tailcat ;;
 	esac
 	case "$cmd" in
 	keygen) cmd_keygen "$@" ;;
@@ -427,6 +440,7 @@ main() {
 	run) cmd_run "$@" ;;
 	push) cmd_push "$@" ;;
 	scp) cmd_scp "$@" ;;
+	forward) cmd_forward "$@" ;;
 	ping) cmd_ping "$@" ;;
 	check) cmd_check "$@" ;;
 	list) cmd_list ;;

@@ -19,7 +19,7 @@ echo "tailcat \$*" >> "$log"
 case "\$*" in
 genkey*) k=\${3#--key=}; echo key > "\$k" ;;
 *printpub) printf 'nodekey:%064d\n' "\$(printf '%s' "\$1" | cksum | cut -d' ' -f1)" ;;
-*" 22") sleep 2 ;;
+*" 22" | *" forward "*) sleep 2 ;;
 esac
 EOF
 cat >"$tmp/bin/ssh" <<EOF
@@ -66,6 +66,16 @@ sleep 0.5
 wait "$p1" "$p2"
 [ "$(grep -c ' 22$' "$log")" = 2 ] || fail "proxies did not dial"
 [ "$(grep ' 22$' "$log" | sort -u | wc -l)" = 2 ] || fail "two proxies shared a client key: $(cat "$log")"
+
+# forward takes a pool key too, and a proxy at the same time gets another one.
+: >"$log"
+"$tether" forward m1 tcOTHER 18080:8080 & p1=$!
+sleep 0.5
+"$tether" proxy m1 & p2=$!
+wait "$p1" "$p2"
+grep -q ' forward tcOTHER 18080:8080$' "$log" || fail "forward not run: $(cat "$log")"
+[ "$(grep -E ' (forward tcOTHER 18080:8080|22)$' "$log" | grep -o -- '--key=[^ ]*' | sort -u | wc -l)" = 2 ] ||
+	fail "forward and proxy shared a client key: $(cat "$log")"
 
 # POSIX run feeds the script to bash -s.
 printf 'echo hi\n' >"$tmp/s.sh"
