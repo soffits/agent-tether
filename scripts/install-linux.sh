@@ -125,7 +125,9 @@ find_tailcat() {
 	local c
 	for c in "$(command -v tailcat 2>/dev/null || true)" /usr/bin/tailcat /usr/local/bin/tailcat "$THOME/.local/bin/tailcat" "$THOME/go/bin/tailcat"; do
 		if [ -n "$c" ] && [ -x "$c" ]; then
-			TAILCAT_BIN=$(readlink -f "$c")
+			# Keep the path as found: version-manager shims (mise, asdf) are
+			# symlinks that break when resolved.
+			TAILCAT_BIN=$c
 			break
 		fi
 	done

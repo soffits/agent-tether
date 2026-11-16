@@ -27,14 +27,16 @@ Files in this skill (paths relative to the skill directory):
 
 | File | Runs on | Purpose |
 |---|---|---|
-| `scripts/tether` | your side (bash) | keys, bootstrap line, ssh/scp/push/run, checks |
+| `scripts/tether` | your side (bash) | keys, bootstrap line, ssh/scp/push/run, checks, proxy |
 | `scripts/install-linux.sh` | target | systemd user service + linger, status, uninstall |
-| `scripts/install-macos.sh` | target | LaunchDaemon, status, uninstall (untested on a real Mac) |
+| `scripts/install-macos.sh` | target | LaunchDaemon, status, uninstall |
 | `scripts/install-windows.ps1` | target | scheduled task (S4U at startup), status, uninstall |
 
-Keep one directory per target on your side, e.g. `~/.local/share/agent-tether/<target-name>`
-(below: `$T`). It holds the target's address and your keys for it. Treat it like a password
-store: whoever has it has a shell on the target.
+Keep one directory per target on your side (below: `$T`). It holds the target's address and
+your keys for it. Treat it like a password store: whoever has it has a shell on the target.
+`$T` can be a path, or just a name: names are looked up in `$TETHER_DIR` (default
+`~/.local/share/agent-tether`), so `scripts/tether ssh my-laptop 'uname -a'` works once the
+directory `$TETHER_DIR/my-laptop` exists. `scripts/tether list` shows the saved targets.
 
 Do not trust the flag names in this file blindly. tailcat makes no CLI stability promises.
 Before giving commands, check them against `tailcat --help`, `tailcat serve --help` and
@@ -54,7 +56,7 @@ have one). Explain the privilege question plainly.
    "If yes, anyone who gets my keys for this machine gets full admin control of it. If no, I
    work as your normal user and ask you to run the occasional admin command yourself."
    Default: no.
-4. **Keep the machine awake on AC power?** A sleeping machine is unreachable. Default: no.
+4. **Keep the machine awake on AC power?** A sleeping machine is unreachable, and the first connection after a pause often fails while it wakes. Default: no.
 5. **Do you also want me to control the desktop (clicks, typing, screenshots)?** If yes, see
    "GUI control" below. The remote shell works without it.
 6. A short name for this machine (used for `$T` and nothing else).
@@ -77,12 +79,20 @@ have one). Explain the privilege question plainly.
 
 ```bash
 T=~/.local/share/agent-tether/<target-name>
-scripts/tether keygen "$T"          # prints NODEKEY=nodekey:... and SSH_PUBKEY=ssh-ed25519 ...
-scripts/tether bootstrap "$T" linux # or macos / windows; prints the one-time command
+scripts/tether keygen "$T" --keys 4   # prints NODEKEY=nodekey:... (one per key) and SSH_PUBKEY=...
+scripts/tether bootstrap "$T" linux   # or macos / windows; prints the one-time command
 ```
 
 `keygen` is idempotent. `bootstrap` records the OS in `$T/os` and prints a single line with
-your nodekey and SSH public key already embedded, so the user never types a key.
+your nodekeys and SSH public key already embedded, so the user never types a key.
+
+Why several client keys: the DERP relay routes by node key, so two connections open at the
+same time with the same client key take the route from each other, and new dials time out
+while the target is fine. `tether` gives each live connection its own key from the pool
+(`client.private.json`, `client-2.private.json`, ...) and holds a lock on it while the
+connection lasts (needs `flock`, which Linux has; elsewhere it uses the first key). One key
+is enough if you never run two connections at once. Every key in the pool goes into the
+target's `--allow` list.
 
 ## Step 4: the one-time elevated bootstrap (the only step the user does)
 
@@ -150,7 +160,7 @@ admin actions are explicit `sudo -n ...` calls that land in the system log, and 
 one file to delete. `--stay-awake` masks the systemd sleep targets (desktop power settings
 then cannot suspend either).
 
-**macOS** (session is root; untested on a real Mac, tell the user):
+**macOS** (session is root):
 
 ```bash
 scripts/tether run "$T" scripts/install-macos.sh install --user <user> \
@@ -158,13 +168,29 @@ scripts/tether run "$T" scripts/install-macos.sh install --user <user> \
   [--privileged] [--stay-awake]
 ```
 
+On a Mac the bootstrap can be skipped: the user can download `install-macos.sh` and run it
+herself in Terminal, as herself (not with sudo), with the same options. It asks for her
+password once, for the LaunchDaemon. If she cancels the password prompt, or anything else
+stops it, running the same line again is safe: the saved key, and so the address, are kept.
+Afterwards she sends you the `ADDRESS=` line; with `--open-settings` it also opens System
+Settings at Full Disk Access with the tailcat binary shown in Finder.
+
+tailcat comes from Homebrew: the installer runs `brew install tailcat` (as the user) when
+Homebrew is there and tailcat is not. GitHub releases have no macOS build, so without
+Homebrew build it from a release tag (`git clone --branch v0.7.0
+https://github.com/tailscale/tailcat && cd tailcat && GOOS=darwin GOARCH=arm64 go build -o
+tailcat-darwin-arm64 ./cmd/tailcat`) and pass `--tailcat <file> --tailcat-sha256 <hex>`;
+the installer checks it and copies it into the agent folder.
+
 Result: `/Library/LaunchDaemons/agent-tether.plist` with `UserName=<user>`, `RunAtLoad`,
 `KeepAlive`, `ThrottleInterval 10`, log at `~<user>/.config/agent-tether/tailcat.log`. A
 LaunchDaemon starts at boot, before login, and `UserName` drops it to the user. A LaunchAgent
 (`~/Library/LaunchAgents`) would only run after she logs in, which is why it is not used for
-the shell. `--stay-awake` runs `pmset -c sleep 0` (restored on uninstall). Note for the user:
-macOS privacy protection (TCC) may block the shell from Desktop, Documents and Downloads
-until the tailcat binary is given Full Disk Access in System Settings.
+the shell. macOS Remote Login stays off: tailcat brings its own SSH server.
+`--stay-awake` runs `pmset -c sleep 0` (restored on uninstall). Note for the user: macOS
+privacy protection (TCC) blocks the shell from Desktop, Documents and Downloads until the
+tailcat binary is given Full Disk Access in System Settings; the installer prints which file.
+A Homebrew upgrade moves the binary, so the grant may need switching on again.
 
 **Windows** (session is elevated PowerShell):
 
@@ -207,12 +233,28 @@ the machine before the service can start; BitLocker with TPM-only unlock does no
 scripts/tether ssh "$T" 'uname -a'                     # one command
 scripts/tether ssh "$T"                                # interactive shell
 scripts/tether run "$T" ./job.sh arg1                  # POSIX: local script via bash -s
+scripts/tether run "$T" --with data.json ./job.ps1 -X 1 # Windows: copied to <remote-dir>\run, run with -File
 scripts/tether scp "$T" ./file target:/tmp/file        # copy (remote side is always "target:")
 scripts/tether scp "$T" target:/var/log/syslog ./
 scripts/tether push "$T" ./file '/tmp/file'            # copy through stdin (works for Windows paths too)
 scripts/tether ping "$T"                               # tunnel only; says DERP or direct path
 ```
 
+- **Copies** use scp's legacy protocol (`-O`), because tailcat's SSH server has no SFTP.
+  On Windows, `target:` paths are relative to the user's home; an absolute path needs a
+  leading slash (`target:/D:/dir/file`).
+- **`run` on Windows** copies the script (and any `--with` files) to `<remote-dir>\run\`
+  (`$T/remote-dir`, default `.config/agent-tether`) and runs it with
+  `powershell -NoProfile -ExecutionPolicy Bypass -File`. Inline PowerShell sent through ssh
+  breaks on quotes and `$env:`, so put anything longer than one line in a script.
+- **Flaky dials** (`Dial: context deadline exceeded`, ssh exit 255, mostly the first
+  connection after a pause): the target was asleep. A Mac with the default power settings
+  idle-sleeps within minutes and wakes for short windows (Power Nap, 2 to 45 seconds) to
+  check in; tailcat is suspended while it sleeps. A ping can be answered at the start of a
+  window and the machine sleeps again before the TCP connection opens, and tailcat gives up
+  a dial after 10 seconds. The relay is not involved. The fix is on the target: install
+  with `--stay-awake` (macOS: `pmset -c sleep 0`) so it stays up on AC power, or tell the
+  user to keep it awake; otherwise rerun the command. `tether` does not retry for you.
 - **POSIX targets**: the command runs through the user's login shell with `-c`, which may be
   fish. For anything beyond a simple command use `tether run` (it sends `bash -s`) or wrap in
   `bash -c '...'`. PATH in the session is minimal (`/usr/local/bin:/usr/bin:/bin`); use full
@@ -230,7 +272,7 @@ scripts/tether ping "$T"                               # tunnel only; says DERP 
 
 ```bash
 scripts/tether run "$T" scripts/install-linux.sh status       # Linux (as the user)
-scripts/tether ssh "$T" 'sudo -n launchctl print system/agent-tether | head -20'   # macOS
+scripts/tether ssh "$T" 'sudo -n launchctl print system/agent-tether | head -20'   # macOS (print needs root)
 scripts/tether ssh "$T" 'Get-ScheduledTask agent-tether | Select TaskName,State; Get-ScheduledTaskInfo agent-tether'  # Windows
 ```
 
@@ -330,6 +372,9 @@ Then clean up your side: `scripts/tether forget "$T"` (deletes the keys and addr
 - **`tether check`: ping with your key fails.** Target off, asleep, offline, or the service is
   not running. Ask the user to look at the status command for her OS. Public DERP relays are
   rate-limited and best effort; retry after a minute.
+- **New dials time out while another connection to the same target is open.** Both use the
+  same client key. Make a pool (`tether keygen "$T" --keys 4`), add the new nodekeys to the
+  target's `--allow` list (rerun the installer with every `--client-nodekey`).
 - **Ping works, SSH login fails.** Wrong or missing `authorized_keys` in the agent-tether
   folder, or the key line has options (`command=`, `from=`): tailcat rejects those.
 - **Freshly generated key is accepted.** `--allow` is missing: fix it now; the address alone is
