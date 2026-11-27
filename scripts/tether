@@ -35,7 +35,7 @@ Usage: tether <command> <target> [args...]
                                and run with powershell -File. --with copies extra files
                                to <remote-dir>/run first
   push <target> <local> <remote>
-                               copy one local text file to a remote path through stdin
+                               copy one local file to a remote path through stdin, byte for byte
   scp <target> [scp args...]   scp through the tether; name the remote side "target:"
   forward <target> <address> <local:remote>...
                                tailcat forward to another tailcat server (an address that
@@ -339,8 +339,10 @@ cmd_push() {
 	ssh_opts
 	if [ "$(target_os "$DIR")" = windows ]; then
 		case "$dst" in *"'"*) die "remote path must not contain single quotes" ;; esac
+		# Raw stdin bytes into the file: [Console]::In would decode them with the console
+		# code page (OEM, CP437 on most PCs) and mangle every non-ASCII character.
 		"$SSH" "${SSH_OPTS[@]}" target \
-			"\$t = [Console]::In.ReadToEnd(); [IO.File]::WriteAllText([Environment]::ExpandEnvironmentVariables('$dst'), \$t)" <"$src"
+			"\$o = [IO.File]::Create([Environment]::ExpandEnvironmentVariables('$dst')); try { [Console]::OpenStandardInput().CopyTo(\$o) } finally { \$o.Dispose() }" <"$src"
 	else
 		"$SSH" "${SSH_OPTS[@]}" target "cat > $(printf '%q' "$dst")" <"$src"
 	fi
