@@ -236,7 +236,7 @@ scripts/tether run "$T" ./job.sh arg1                  # POSIX: local script via
 scripts/tether run "$T" --with data.json ./job.ps1 -X 1 # Windows: copied to <remote-dir>\run, run with -File
 scripts/tether scp "$T" ./file target:/tmp/file        # copy (remote side is always "target:")
 scripts/tether scp "$T" target:/var/log/syslog ./
-scripts/tether push "$T" ./file '/tmp/file'            # copy through stdin (works for Windows paths too)
+scripts/tether push "$T" ./file '/tmp/file'            # copy through stdin, byte for byte (Windows paths too; no BOM, no re-encoding)
 scripts/tether ping "$T"                               # tunnel only; says DERP or direct path
 scripts/tether forward "$T" <address> 18080:8080      # tailcat forward to a service that accepts the same client keys
 ```

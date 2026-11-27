@@ -27,7 +27,7 @@ cat >"$tmp/bin/ssh" <<EOF
 printf 'ssh' >> "$log"; printf ' [%s]' "\$@" >> "$log"; echo >> "$log"
 n=\$(cat "$tmp/ssh-fails" 2>/dev/null || echo 0)
 if [ "\$n" -gt 0 ]; then echo \$((n - 1)) > "$tmp/ssh-fails"; exit 255; fi
-cat > /dev/null
+cat > "$tmp/ssh-stdin"
 echo ok
 EOF
 cat >"$tmp/bin/scp" <<EOF
@@ -95,6 +95,20 @@ grep -qF "[$tmp/x.ps1] [target:.config/me/run/x.ps1]" "$log" || fail "script not
 grep '^scp' "$log" | grep -qF '[-O]' || fail "scp without -O (tailcat has no SFTP)"
 grep -qF '[powershell] [-NoProfile] [-ExecutionPolicy] [Bypass] [-File] [.config\me\run\x.ps1] [-Flag] [1]' "$log" ||
 	fail "windows run command: $(grep '^ssh' "$log" | tail -1)"
+
+# push sends the file's bytes untouched (UTF-8, no CRLF, no BOM) on every OS, and the Windows
+# command writes them with a raw stream, never through the console's text decoder (CP437).
+printf '#!/bin/bash\necho "\xc3\xa0 P\xc3\xa9kin, r\xc3\xa9p\xc3\xa9ter \xe6\x97\xa5\xe6\x9c\xac \xf0\x9f\x8e\x89"\n' >"$tmp/utf8.sh"
+for os in linux windows; do
+	echo "$os" >"$TETHER_DIR/m1/os"
+	: >"$log"
+	rm -f "$tmp/ssh-stdin"
+	"$tether" push m1 "$tmp/utf8.sh" '%USERPROFILE%\x.sh' >/dev/null
+	cmp -s "$tmp/utf8.sh" "$tmp/ssh-stdin" || fail "push to $os changed the bytes"
+done
+call=$(grep '^ssh' "$log" | tail -1)
+grep -qF 'OpenStandardInput().CopyTo' <<<"$call" || fail "windows push does not copy raw stdin: $call"
+if grep -qE 'Console\]::In|ReadToEnd|WriteAllText' <<<"$call"; then fail "windows push decodes text: $call"; fi
 
 # A connection that fails to open is not retried; the error says what it usually means.
 echo 1 >"$tmp/ssh-fails"
